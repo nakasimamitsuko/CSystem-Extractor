@@ -656,72 +656,108 @@ def unpack(index_path: str, content_paths: list, output_dir: str):
         if reader.entries:
             print(f"Archive version: {reader.entries[0].version}")
 
-        # 可能需要多轮(delta图依赖基础图先解包)
-        remaining = list(reader.entries)
-        while remaining:
-            failed = []
-            for entry in remaining:
-                try:
-                    content = reader.get_entry_content(entry)
-                    if entry.type == 'b':
-                        if not _try_unpack_image(reader, entry, content, output_dir):
-                            failed.append(entry)
-                            continue
-                    else:
-                        fname = get_raw_filename(entry.id, entry.type, entry.sub_type)
-                        with open(os.path.join(output_dir, fname), 'wb') as f:
-                            f.write(content)
-                    print(f"  解包 {entry.id:06d} (type {entry.type}{entry.sub_type})")
-                except Exception as e:
-                    print(f"  [错误] {entry.id:06d}: {e}")
-                    failed.append(entry)
+        # 按类型分组处理图像
+        b_entries = [e for e in reader.entries if e.type == 'b']
+        other_entries = [e for e in reader.entries if e.type != 'b']
 
-            if len(failed) == len(remaining):
-                print(f"[警告] {len(failed)} 个条目无法解包(可能缺少基础图)")
-                for e in failed:
-                    # 保存原始数据
-                    content = reader.get_entry_content(e)
-                    fname = get_raw_filename(e.id, e.type, e.sub_type)
-                    with open(os.path.join(output_dir, fname), 'wb') as f:
-                        f.write(content)
-                    print(f"  保存原始 {e.id:06d}")
-                break
-            remaining = failed
+        # 先解包非图像文件
+        for entry in other_entries:
+            try:
+                content = reader.get_entry_content(entry)
+                fname = get_raw_filename(entry.id, entry.type, entry.sub_type)
+                with open(os.path.join(output_dir, fname), 'wb') as f:
+                    f.write(content)
+                print(f"  解包 {entry.id:06d} (type {entry.type}{entry.sub_type})")
+            except Exception as e:
+                print(f"  [错误] {entry.id:06d}: {e}")
+
+        # 解包图像: 先读取所有图像到内存，再处理 delta 合并
+        if b_entries:
+            _unpack_images(reader, b_entries, output_dir)
 
     print(f"完成, 输出到 {output_dir}")
 
 
-def _try_unpack_image(reader, entry, content, output_dir):
-    img = CSystemImage()
-    img.read(content)
+def _unpack_images(reader, b_entries, output_dir):
+    """解包所有图像，正确处理 delta 合并"""
+    # 第一遍: 读取所有图像数据到内存
+    images = {}  # index -> CSystemImage
+    entry_map = {}  # index -> entry
 
-    filename = get_image_filename(entry.id)
+    for entry in b_entries:
+        try:
+            content = reader.get_entry_content(entry)
+            img = CSystemImage()
+            img.read(content)
+            images[entry.index] = img
+            entry_map[entry.index] = entry
+        except Exception as e:
+            print(f"  [错误] {entry.id:06d}: 读取失败 - {e}")
 
-    if img.base_index == -1 or img.base_index == entry.index:
-        # 完整图或标准包装图
-        img.save_as_png(os.path.join(output_dir, filename))
-        return True
+    # 第二遍: 处理完整图和 delta 图
+    saved_count = 0
+    for entry in b_entries:
+        if entry.index not in images:
+            continue
 
-    # delta图 - 需要基础图
-    base_entry = reader.entries_by_type.get(entry.type, [])[img.base_index]
-    base_folder = os.path.join(output_dir, get_image_foldername(base_entry.id))
-    os.makedirs(base_folder, exist_ok=True)
+        img = images[entry.index]
 
-    base_filename = get_image_filename(base_entry.id)
-    base_in_root = os.path.join(output_dir, base_filename)
-    base_in_folder = os.path.join(base_folder, base_filename)
+        try:
+            if img.mask is not None and img.base_index != entry.index:
+                # delta 图 — 需要合并到基础图上
+                if img.base_index not in images:
+                    print(f"  [警告] {entry.id:06d}: 基础图 index={img.base_index} 不存在")
+                    # 保存为不完整图（标注 delta）
+                    img.save_as_png(os.path.join(output_dir, f"{entry.id:06d}_delta.png"))
+                    print(f"  解包 {entry.id:06d} (type b0, delta 未合并)")
+                    saved_count += 1
+                    continue
 
-    if os.path.exists(base_in_root) and not os.path.exists(base_in_folder):
-        os.rename(base_in_root, base_in_folder)
+                base_img = images[img.base_index]
+                base_entry = entry_map[img.base_index]
 
-    if not os.path.exists(base_in_folder):
-        return False
+                # 确保基础图是完整图
+                if base_img.mask is not None:
+                    print(f"  [警告] {entry.id:06d}: 基础图 {base_entry.id:06d} 也是 delta 图")
+                    img.save_as_png(os.path.join(output_dir, f"{entry.id:06d}_delta.png"))
+                    saved_count += 1
+                    continue
 
-    base_img = CSystemImage()
-    base_img.load_from_png_as_csystem(base_in_folder)
-    img.convert_delta_to_full(base_img)
-    img.save_as_png(os.path.join(base_folder, filename))
-    return True
+                # 基础图放在以其 id 命名的文件夹中
+                base_folder = os.path.join(output_dir, get_image_foldername(base_entry.id))
+                os.makedirs(base_folder, exist_ok=True)
+
+                # 确保基础图已保存到文件夹中
+                base_png = os.path.join(base_folder, get_image_filename(base_entry.id))
+                base_in_root = os.path.join(output_dir, get_image_filename(base_entry.id))
+                if os.path.exists(base_in_root) and not os.path.exists(base_png):
+                    os.rename(base_in_root, base_png)
+                if not os.path.exists(base_png):
+                    base_img.save_as_png(base_png)
+
+                # 合并 delta
+                img.convert_delta_to_full(base_img)
+                img.save_as_png(os.path.join(base_folder, get_image_filename(entry.id)))
+                print(f"  解包 {entry.id:06d} (type b0, delta -> {base_entry.id:06d})")
+            else:
+                # 完整图或标准包装图
+                img.save_as_png(os.path.join(output_dir, get_image_filename(entry.id)))
+                print(f"  解包 {entry.id:06d} (type b0)")
+
+            saved_count += 1
+        except Exception as e:
+            print(f"  [错误] {entry.id:06d}: {e}")
+            # 保存原始数据供调试
+            try:
+                content = reader.get_entry_content(entry)
+                raw_path = os.path.join(output_dir, get_raw_filename(entry.id, 'b', '0'))
+                with open(raw_path, 'wb') as f:
+                    f.write(content)
+                print(f"         已保存原始数据: {raw_path}")
+            except:
+                pass
+
+    print(f"  图像: {saved_count}/{len(b_entries)} 完成")
 
 
 # ============================================================
