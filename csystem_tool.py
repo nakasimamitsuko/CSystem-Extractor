@@ -32,12 +32,64 @@ import struct
 import os
 import io
 import argparse
+import ctypes
+import ctypes.util
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from PIL import Image
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+
+# ============================================================
+# C 加速库自动检测
+# ============================================================
+
+_lzss_lib = None
+
+def _load_native_lib():
+    global _lzss_lib
+    if _lzss_lib is not None:
+        return _lzss_lib
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    if sys.platform == 'win32':
+        candidates = [
+            os.path.join(script_dir, 'lzss_fast.dll'),
+            'lzss_fast.dll',
+        ]
+    else:
+        candidates = [
+            os.path.join(script_dir, 'lzss_fast.so'),
+            'lzss_fast.so',
+        ]
+
+    for path in candidates:
+        try:
+            lib = ctypes.CDLL(path)
+            lib.lzss_decompress_c.argtypes = [
+                ctypes.c_char_p, ctypes.c_int,
+                ctypes.c_char_p, ctypes.c_int
+            ]
+            lib.lzss_decompress_c.restype = ctypes.c_int
+            lib.lzss_compress_c.argtypes = [
+                ctypes.c_char_p, ctypes.c_int,
+                ctypes.c_char_p, ctypes.c_int
+            ]
+            lib.lzss_compress_c.restype = ctypes.c_int
+            _lzss_lib = lib
+            return lib
+        except (OSError, AttributeError):
+            continue
+    return None
+
+HAS_NATIVE = _load_native_lib() is not None
+if HAS_NATIVE:
+    print("[加速] 已加载 lzss_fast 原生库")
+else:
+    print("[提示] 未找到 lzss_fast 原生库, 使用纯 Python (运行 python build_lzss.py 编译加速库)")
 
 
 # ============================================================
@@ -76,6 +128,29 @@ CHAR_FILLER = 0x00
 
 
 def lzss_decompress(src: bytes, decompressed_size: int) -> bytes:
+    lib = _load_native_lib()
+    if lib is not None:
+        dst = ctypes.create_string_buffer(decompressed_size)
+        ret = lib.lzss_decompress_c(src, len(src), dst, decompressed_size)
+        if ret >= 0:
+            return dst.raw[:ret]
+
+    return _lzss_decompress_py(src, decompressed_size)
+
+
+def lzss_compress(data: bytes) -> bytes:
+    lib = _load_native_lib()
+    if lib is not None:
+        max_out = len(data) * 2 + 1024
+        dst = ctypes.create_string_buffer(max_out)
+        ret = lib.lzss_compress_c(data, len(data), dst, max_out)
+        if ret >= 0:
+            return dst.raw[:ret]
+
+    return _lzss_compress_py(data)
+
+
+def _lzss_decompress_py(src: bytes, decompressed_size: int) -> bytes:
     ring = bytearray([CHAR_FILLER] * WINDOW_SIZE)
     ring_pos = WINDOW_SIZE - MAX_MATCH_LENGTH
     output = bytearray()
@@ -123,7 +198,7 @@ def lzss_decompress(src: bytes, decompressed_size: int) -> bytes:
     return bytes(output)
 
 
-def lzss_compress(data: bytes) -> bytes:
+def _lzss_compress_py(data: bytes) -> bytes:
     """LZSS压缩, 简单匹配实现"""
     ring = bytearray([CHAR_FILLER] * WINDOW_SIZE)
     ring_pos = WINDOW_SIZE - MAX_MATCH_LENGTH
