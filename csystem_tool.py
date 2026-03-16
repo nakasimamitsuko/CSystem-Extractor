@@ -588,21 +588,66 @@ class CSystemImage:
         if self.mask is not None:
             raise ValueError("不能直接保存delta图, 需要先合并基础图")
 
-        row_stride = self.width * 3 + (self.width & 3)
-        argb = bytearray(self.width * 4 * self.height)
+        if not self.color:
+            raise ValueError("无 color 数据")
+
+        # 从 color 数据大小反推真实尺寸
+        # 引擎的 width/height 字段可能是渲染位置偏移而非实际图片尺寸
+        w = self.width
+        h = self.height
+        row_stride = w * 3 + (w & 3)
+        expected = row_stride * h
+
+        if expected > len(self.color) and w > 0:
+            # width/height 与 color 数据不匹配，从 color 大小反推
+            actual_h = len(self.color) // row_stride
+            if actual_h > 0 and row_stride * actual_h == len(self.color):
+                h = actual_h
+            else:
+                # 尝试不带对齐
+                if len(self.color) % (w * 3) == 0:
+                    h = len(self.color) // (w * 3)
+                    row_stride = w * 3
+                else:
+                    # 最后手段: 从总像素数推算
+                    total_pixels = len(self.color) // 3
+                    if total_pixels > 0 and w > 0:
+                        h = total_pixels // w
+                        if h == 0:
+                            # w 也不对，尝试正方形
+                            import math
+                            side = int(math.isqrt(total_pixels))
+                            w, h = side, side
+                        row_stride = w * 3
+
+        argb = bytearray(w * 4 * h)
         input_offset = 0
         output_offset = 0
-        for y in range(self.height):
-            for x in range(self.width):
-                argb[output_offset + 0] = self.color[input_offset + 2]  # R (BGR->RGB)
-                argb[output_offset + 1] = self.color[input_offset + 1]  # G
-                argb[output_offset + 2] = self.color[input_offset + 0]  # B
-                argb[output_offset + 3] = self.alpha[input_offset] if self.alpha else 0xFF
+        color_len = len(self.color)
+        alpha_len = len(self.alpha) if self.alpha else 0
+
+        for y in range(h):
+            for x in range(w):
+                if input_offset + 2 < color_len:
+                    argb[output_offset + 0] = self.color[input_offset + 2]  # R (BGR->RGB)
+                    argb[output_offset + 1] = self.color[input_offset + 1]  # G
+                    argb[output_offset + 2] = self.color[input_offset + 0]  # B
+                else:
+                    argb[output_offset + 0] = 0
+                    argb[output_offset + 1] = 0
+                    argb[output_offset + 2] = 0
+
+                if self.alpha and input_offset < alpha_len:
+                    argb[output_offset + 3] = self.alpha[input_offset]
+                else:
+                    argb[output_offset + 3] = 0xFF
+
                 input_offset += 3
                 output_offset += 4
-            input_offset += self.width & 3
+            # 行对齐跳过
+            input_offset += (row_stride - w * 3)
 
-        img = Image.frombytes('RGBA', (self.width, self.height), bytes(argb))
+        img = Image.frombytes('RGBA', (w, h), bytes(argb))
         img.save(filepath, 'PNG')
 
     def load_from_png_as_wrapper(self, filepath: str):
